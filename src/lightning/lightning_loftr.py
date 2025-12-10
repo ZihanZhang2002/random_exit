@@ -137,27 +137,20 @@ class PL_LoFTR(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self._trainval_inference(batch)
 
-        # ===== Log random-exit cross-block index on progress bar & TensorBoard =====
-        # 由 LocalFeatureTransformer 写入 batch['coarse_exit_block_idx']
+        # ===== 1. Log random-exit cross-block index （来自 LocalFeatureTransformer）=====
         exit_block = batch.get('coarse_exit_block_idx', None)
         if exit_block is not None:
-            # 兼容三种情况：
-            # 1) python int / float（当前实现）
-            # 2) 标量 tensor
-            # 3) 向量 tensor（未来如果你按 sample 记录的话，取平均做一个 summary）
             if isinstance(exit_block, torch.Tensor):
                 exit_block = exit_block.to(self.device)
                 if exit_block.numel() > 1:
-                    # per-sample 的情况：取平均，保证 log 的是一个 scalar
+                    # per-sample 情况：取平均作为 summary
                     exit_block = exit_block.float().mean()
                 else:
-                    # 标量 tensor -> 0-dim
                     exit_block = exit_block.float().reshape(())
             else:
                 # python 标量 -> tensor
                 exit_block = torch.tensor(exit_block, device=self.device, dtype=torch.float32)
 
-            # 在进度条 (prog_bar) 和 TensorBoard (logger) 上同步显示
             self.log(
                 'train/exit_block_idx',
                 exit_block,
@@ -167,7 +160,7 @@ class PL_LoFTR(pl.LightningModule):
                 logger=True,
             )
 
-        # ===== 原有 logging 逻辑保持不变 =====
+        # ===== 2. 原有 logging 逻辑（loss 等）保持不变 =====
         if self.trainer.global_rank == 0 and self.global_step % self.trainer.log_every_n_steps == 0:
             # scalars
             for k, v in batch['loss_scalars'].items():
@@ -180,7 +173,46 @@ class PL_LoFTR(pl.LightningModule):
                 for k, v in figures.items():
                     self.logger.experiment.add_figure(f'train_match/{k}', v, self.global_step)
 
+        # ===== 3. 给 auc@5/10/20 打 dummy 值，保证 ckpt monitor 不会找不到 key =====
+        # 用当前 batch loss 当占位即可；真正的 AUC 会在 validation_epoch_end 里覆盖
+        dummy_auc = batch['loss'].detach()
+        for thr in [5, 10, 20]:
+            self.log(
+                f'auc@{thr}',
+                dummy_auc,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,   # 一定要 True，这样才会进 callback_metrics，给 ModelCheckpoint 用
+            )
+
         return {'loss': batch['loss']}
+
+    def training_epoch_end(self, outputs):
+        avg_loss = torch.stack([x['loss'] for x in outputs]).mean()
+        if self.trainer.global_rank == 0:
+            self.logger.experiment.add_scalar(
+                'train/avg_loss_on_epoch', avg_loss,
+                global_step=self.current_epoch)
+
+    def on_validation_epoch_start(self):
+        self.matcher.fine_matching.validate = True
+
+    def validation_step(self, batch, batch_idx):
+        self._trainval_inference(batch)
+
+        ret_dict, _ = self._compute_metrics(batch)
+
+        val_plot_interval = max(self.trainer.num_val_batches[0] // self.n_vals_plot, 1)
+        figures = {self.config.TRAINER.PLOT_MODE: []}
+        if batch_idx % val_plot_interval == 0:
+            figures = make_matching_figures(batch, self.config, mode=self.config.TRAINER.PLOT_MODE)
+
+        return {
+            **ret_dict,
+            'loss_scalars': batch['loss_scalars'],
+            'figures': figures,
+        }
 
     def validation_epoch_end(self, outputs):
         self.matcher.fine_matching.validate = False
@@ -196,11 +228,17 @@ class PL_LoFTR(pl.LightningModule):
 
             # 1. loss_scalars: dict of list, on cpu
             _loss_scalars = [o['loss_scalars'] for o in outputs]
-            loss_scalars = {k: flattenList(all_gather([_ls[k] for _ls in _loss_scalars])) for k in _loss_scalars[0]}
+            loss_scalars = {
+                k: flattenList(all_gather([_ls[k] for _ls in _loss_scalars]))
+                for k in _loss_scalars[0]
+            }
 
             # 2. val metrics: dict of list, numpy
             _metrics = [o['metrics'] for o in outputs]
-            metrics = {k: flattenList(all_gather(flattenList([_me[k] for _me in _metrics]))) for k in _metrics[0]}
+            metrics = {
+                k: flattenList(all_gather(flattenList([_me[k] for _me in _metrics])))
+                for k in _metrics[0]
+            }
             # NOTE: all ranks need to `aggregate_merics`, but only log at rank-0
             val_metrics_4tb = aggregate_metrics(metrics, self.config.TRAINER.EPI_ERR_THR, config=self.config)
             for thr in [5, 10, 20]:
@@ -208,7 +246,10 @@ class PL_LoFTR(pl.LightningModule):
 
             # 3. figures
             _figures = [o['figures'] for o in outputs]
-            figures = {k: flattenList(gather(flattenList([_me[k] for _me in _figures]))) for k in _figures[0]}
+            figures = {
+                k: flattenList(gather(flattenList([_me[k] for _me in _figures])))
+                for k in _figures[0]
+            }
 
             # tensorboard records only on rank 0
             if self.trainer.global_rank == 0:
@@ -220,15 +261,21 @@ class PL_LoFTR(pl.LightningModule):
                     self.logger.experiment.add_scalar(f"metrics_{valset_idx}/{k}", v, global_step=cur_epoch)
 
                 for k, v in figures.items():
-                    if self.trainer.global_rank == 0:
-                        for plot_idx, fig in enumerate(v):
-                            self.logger.experiment.add_figure(
-                                f'val_match_{valset_idx}/{k}/pair-{plot_idx}', fig, cur_epoch, close=True)
+                    for plot_idx, fig in enumerate(v):
+                        self.logger.experiment.add_figure(
+                            f'val_match_{valset_idx}/{k}/pair-{plot_idx}', fig, cur_epoch, close=True)
             plt.close('all')
 
+        # ===== 这里是真正的 epoch-level AUC，覆盖掉前面的 dummy =====
         for thr in [5, 10, 20]:
-            # log on all ranks for ModelCheckpoint callback to work properly
-            self.log(f'auc@{thr}', torch.tensor(np.mean(multi_val_metrics[f'auc@{thr}'])))
+            self.log(
+                f'auc@{thr}',
+                torch.tensor(np.mean(multi_val_metrics[f'auc@{thr}'])),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=(thr == 10),   # 只把 auc@10 放进进度条
+                logger=True,
+            )
 
     def test_step(self, batch, batch_idx):
         if (self.config.LOFTR.BACKBONE_TYPE == 'RepVGG') and not self.reparameter:
@@ -268,7 +315,10 @@ class PL_LoFTR(pl.LightningModule):
     def test_epoch_end(self, outputs):
         # metrics: dict of list, numpy
         _metrics = [o['metrics'] for o in outputs]
-        metrics = {k: flattenList(gather(flattenList([_me[k] for _me in _metrics]))) for k in _metrics[0]}
+        metrics = {
+            k: flattenList(gather(flattenList([_me[k] for _me in _metrics])))
+            for k in _metrics[0]
+        }
 
         # [{key: [{...}, *#bs]}, *#batch]
         if self.trainer.global_rank == 0:
